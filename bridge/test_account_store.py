@@ -194,6 +194,14 @@ class AccountManagementTests(unittest.TestCase):
         source.write_bytes(b'synthetic original')
         sidecar = Path(str(result_b) + '-journal')
         sidecar.write_bytes(b'synthetic rollback sidecar')
+        backups_b = [self.data / (account_id(b) + suffix) for suffix in (
+            '.pre-wv1.sqlite3', '.pre-wv1.json', '.restore-undo.sqlite3', '.restore-undo.key.bin', '.restore-undo.json')]
+        for backup in backups_b:
+            backup.write_bytes(b'synthetic account rollback backup')
+        backup_a = self.data / (account_id(a) + '.pre-wv1.sqlite3')
+        backup_a.write_bytes(b'other synthetic backup')
+        shared_key = self.root / 'analysis-key.backup.bin'
+        shared_key.write_bytes(b'synthetic protected global key backup')
         enabled = gc.isenabled()
         gc.disable()
         try:
@@ -208,6 +216,9 @@ class AccountManagementTests(unittest.TestCase):
         self.assertFalse(result_b.exists())
         self.assertFalse(snapshot.exists())
         self.assertFalse(sidecar.exists())
+        self.assertFalse(any(backup.exists() for backup in backups_b))
+        self.assertTrue(backup_a.exists())
+        self.assertTrue(shared_key.exists())
         self.assertEqual(result_a.read_bytes(), before)
         self.assertFalse(key_file.exists())
         self.assertFalse(stable_b.exists())
@@ -216,6 +227,19 @@ class AccountManagementTests(unittest.TestCase):
         self.assertEqual(self.backend.shutdown_calls, [])
         self.assertFalse(self.api.no_recovery_marker.exists())
         self.assertEqual(len(self.api.list()['accounts']), 1)
+
+    def test_other_instance_lease_rejects_clear_before_any_writer_drain(self):
+        from account_leases import AccountLeaseRegistry
+        account = 'wxid_b_efgh'
+        path = self.observe(account)
+        self.observe('wxid_a_abcd')
+        competitor = AccountLeaseRegistry(lease_root=self.api.account_leases.directory)
+        before = path.read_bytes()
+        with competitor.hold(account):
+            with self.assertRaises(AccountConflict):
+                self.api.delete(account_id(account))
+        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(self.backend.pause_calls, [])
 
     def test_current_account_waits_for_stop_then_clears_only_its_files(self):
         a, b = 'wxid_a_abcd', 'wxid_b_efgh'

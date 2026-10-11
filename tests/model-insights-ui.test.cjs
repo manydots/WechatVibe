@@ -28,7 +28,12 @@ const code = section("async function api(", "function status(") +
 function element(tag, className = "", value = "") {
   const node = {
     tag, className, textContent: value == null ? "" : String(value), value: "", hidden: false,
-    disabled: false, dataset: {}, children: [], parent: null,
+    disabled: false, dataset: {}, attributes: {}, children: [], parent: null,
+    // renderModelBadgeMenu() builds the "管理 API 配置…" foot button and marks it
+    // role="menuitem"; without these the whole model-source flow threw in tests.
+    setAttribute(name, value) { this.attributes[name] = String(value); },
+    removeAttribute(name) { delete this.attributes[name]; },
+    getAttribute(name) { return this.attributes[name] ?? null; },
     appendChild(child) { child.parent = this; this.children.push(child); return child; },
     append(...children) { for (const child of children) this.appendChild(child); },
     addEventListener() {},
@@ -94,6 +99,9 @@ function harness(fetchImpl = async () => response({ account: "acct", sourceId: "
     fetch: fetchImpl,
     setTimeout: () => 1, clearTimeout() {},
     settings: { intent: true }, currentAccount: "acct", currentUser: "chat",
+    // Inline labelling only runs for a conversation the user asked for with the card button,
+    // so the scenario has to be one that was requested.
+    requestedConversations: new Set(["chat"]),
     view: "chat", apiPortraitSnapshot: null,
     syncPortraitMode() {}, cancelApiPortraitPoll() {}, clearApiPortraitView() {}, loadProfile() {},
     controller: new AbortController(), generation: 1, historyState: null,
@@ -101,7 +109,7 @@ function harness(fetchImpl = async () => response({ account: "acct", sourceId: "
     localModelResolved: false, localModelReady: false,
     runtimeSnapshot: null, runtimeBusy: false, incrementalFailed: false, recentFailed: false,
     messages: [], results: {}, inlineIntentPending: new Map(),
-    CURRENT_LABEL_SCHEMA: "generic-v9", catalogReady: true, catalogLabelRevision: 0,
+    CURRENT_LABEL_SCHEMA: "generic-v11", catalogReady: true, catalogLabelRevision: 0,
     fineMessageResult: result => result?.state === "done",
     rankedEmotionScores: () => [{ item: { label: "本地情绪", probability: 0.8 } }],
     appendScoreLine: row => row.appendChild(element("span", "intent-pct", "80%")),
@@ -128,7 +136,7 @@ it("switches bubble labels by source without mixing cached Laya and API results"
   const { ui, context } = harness();
   const message = { id: "m1", side: "other", kind: "text", text: "请把文件发给我" };
   context.messages = [message];
-  context.results = { m1: { state: "done", labelSchema: "generic-v9", emotion: [], intent: [] } };
+  context.results = { m1: { state: "done", labelSchema: "generic-v11", emotion: [], intent: [] } };
   const bubble = messageNode();
   ui.showModelSource(localState);
   ui.updateLabel(message, bubble);
@@ -540,7 +548,7 @@ it("reports API failure without falling back to local bubble labels", async () =
   const { ui, context, byId } = harness(async () => ({ ok: false, status: 503 }));
   const message = { id: "m1", side: "other", kind: "text", text: "请把文件发给我" };
   context.messages = [message];
-  context.results = { m1: { state: "done", labelSchema: "generic-v9", emotion: [], intent: [] } };
+  context.results = { m1: { state: "done", labelSchema: "generic-v11", emotion: [], intent: [] } };
   ui.showModelSource(apiState());
   await tick();
   const bubble = messageNode();

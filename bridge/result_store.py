@@ -7,10 +7,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
-from contextlib import contextmanager
+import time
+import uuid
+from pathlib import Path
+from contextlib import closing, contextmanager
 
 from backend_contracts import (
     FINE_LABEL_SCHEMA, LOCAL_SOURCE_ID, ROOT, empty_api_portrait, valid_api_portrait,
@@ -21,6 +25,9 @@ from profile_signals import keyword_counts
 from profile_state import (empty_state as empty_profile_state, add_result as add_profile_result,
                            covers_tail_emotions)
 from api_portrait_statistics import empty_statistics, valid_statistics
+from payload_crypto import PayloadCipher, PayloadUnreadable, default_cipher
+from process_lock import ProcessLock, checked_path
+from guidance_contracts import valid_guidance_payload
 
 
 def project_result_store(account, _workdir):
@@ -28,12 +35,38 @@ def project_result_store(account, _workdir):
     directory = ROOT / ".local" / "real-client-data"
     directory.mkdir(parents=True, exist_ok=True)
     filename = hashlib.sha256(account.encode("utf-8")).hexdigest() + ".sqlite3"
-    return ResultStore(directory / filename)
+    return ResultStore(directory / filename, cipher=default_cipher(ROOT))
+
+
+def _file_digest(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+class _BackedPayloadCipher:
+    def __init__(self, store, cipher):
+        self.store, self.cipher = store, cipher
+
+    def loads(self, value):
+        return self.cipher.loads(value)
+
+    def dumps(self, value):
+        sealed = self.cipher.dumps(value)
+        self.store._ensure_payload_backup(self.cipher)
+        return sealed
 
 
 class ResultStore:
-    def __init__(self, path):
+    def __init__(self, path, *, cipher=None):
         self.path = path
+        # The production factory supplies the protected cipher. Injectable JSON
+        # keeps isolated synthetic repositories independent of Windows DPAPI.
+        self._payload_backup_ready = False
+        self.cipher = (_BackedPayloadCipher(self, cipher) if isinstance(cipher, PayloadCipher)
+                       else cipher if cipher is not None else json)
         self.profile_lock = threading.RLock()
         with self.connect() as conn:
             # Serialize first-time schema creation and nullable-column migration.
@@ -89,6 +122,11 @@ class ResultStore:
             conn.execute("CREATE TABLE IF NOT EXISTS api_source_meta_v1 (account TEXT NOT NULL, "
                          "source_id TEXT NOT NULL, protocol TEXT NOT NULL, model TEXT NOT NULL, "
                          "PRIMARY KEY(account,source_id))")
+            conn.execute("CREATE TABLE IF NOT EXISTS api_guidance_v1 (account TEXT NOT NULL, "
+                         "session TEXT NOT NULL, source_id TEXT NOT NULL, subject TEXT NOT NULL, "
+                         "revision TEXT NOT NULL, scenario TEXT NOT NULL, analyze_self INTEGER NOT NULL, "
+                         "payload_json TEXT NOT NULL, updated_at INTEGER NOT NULL, "
+                         "PRIMARY KEY(account,session,source_id,subject))")
             conn.execute("CREATE TABLE IF NOT EXISTS analysis_cache_suspended_v1 (account TEXT NOT NULL, "
                          "source_id TEXT NOT NULL, PRIMARY KEY(account,source_id))")
             conn.execute("CREATE TABLE IF NOT EXISTS progress_v1 (account TEXT NOT NULL, session TEXT NOT NULL, "
@@ -118,6 +156,58 @@ class ResultStore:
                          "session TEXT NOT NULL,subject TEXT NOT NULL,PRIMARY KEY(account,session,subject))")
             conn.execute("CREATE INDEX IF NOT EXISTS results_profile_delta_v1 ON results_v2 (account,session,version)")
             conn.execute("CREATE INDEX IF NOT EXISTS results_member_delta_v1 ON results_v2 (account,session,version,sender)")
+        # Establish the one-time rollback point before any caller can open a
+        # write transaction. SQLite.backup cannot run behind our own write lock.
+        if isinstance(cipher, PayloadCipher):
+            self._ensure_payload_backup(cipher)
+
+    def _ensure_payload_backup(self, cipher):
+        if self._payload_backup_ready or cipher.key_path is None:
+            return
+        path = checked_path(self.path)
+        backup = path.with_suffix(".pre-wv1.sqlite3")
+        manifest = path.with_suffix(".pre-wv1.json")
+        with ProcessLock(path.with_suffix(".payload-backup.lock")).acquire(timeout=10):
+            checked_path(backup)
+            checked_path(manifest)
+            key_backup = cipher.backup_key()
+            if manifest.exists():
+                try:
+                    value = json.loads(manifest.read_text(encoding="utf-8"))
+                    if (value.get("schema") != 1 or value.get("database") != backup.name or
+                            not backup.is_file() or value.get("sha256") != _file_digest(backup) or
+                            value.get("keyBackup") != os.path.relpath(key_backup, path.parent) or
+                            value.get("keySha256") != _file_digest(key_backup)):
+                        raise ValueError("invalid backup")
+                except (OSError, ValueError, TypeError, AttributeError) as exc:
+                    raise PayloadUnreadable("分析数据恢复备份不可用，原文件已保留") from exc
+            else:
+                temporary = backup.with_name(backup.name + "." + uuid.uuid4().hex + ".tmp")
+                pending_manifest = manifest.with_name(manifest.name + "." + uuid.uuid4().hex + ".tmp")
+                try:
+                    if not backup.exists():
+                        with closing(sqlite3.connect(path, timeout=15)) as source:
+                            destination = sqlite3.connect(temporary)
+                            try:
+                                source.backup(destination)
+                            finally:
+                                destination.close()
+                        with temporary.open("r+b") as stream:
+                            os.fsync(stream.fileno())
+                        os.link(temporary, backup)
+                    value = {"schema": 1, "database": backup.name, "sha256": _file_digest(backup),
+                             "keyBackup": os.path.relpath(key_backup, path.parent),
+                             "keySha256": _file_digest(key_backup), "createdAt": int(time.time()),
+                             "format": "pre-wv1", "containsLegacyPlaintext": True}
+                    with pending_manifest.open("x", encoding="utf-8") as stream:
+                        json.dump(value, stream, ensure_ascii=False)
+                        stream.flush()
+                        os.fsync(stream.fileno())
+                    os.link(pending_manifest, manifest)
+                finally:
+                    temporary.unlink(missing_ok=True)
+                    pending_manifest.unlink(missing_ok=True)
+            self._payload_backup_ready = True
 
     def analysis_progress_rows(self, account, version):
         """Per-conversation scan state for the whole-account progress read.
@@ -287,7 +377,7 @@ class ResultStore:
         if row is None:
             return {"cursor": None, "complete": False, "context": [], "eligible": 0}
         return {"cursor": tuple(row[:3]) if row[0] is not None else None,
-                "complete": bool(row[3]), "context": json.loads(row[4]), "eligible": row[5]}
+                "complete": bool(row[3]), "context": self.cipher.loads(row[4]), "eligible": row[5]}
 
     def advance(self, account, user, version, cursor, context, item=None, complete=False):
         """Commit only the scan cursor; result summaries are updated on first save."""
@@ -309,7 +399,7 @@ class ResultStore:
             conn.execute("UPDATE progress_v1 SET cursor_seq=?,cursor_shard=?,cursor_local=?,complete=?,"
                          "context_json=?,eligible_count=? WHERE account=? AND session=? AND version=?",
                          (seq, shard, local_id, int(complete),
-                          json.dumps(list(context), ensure_ascii=False), eligible, account, user, version))
+                          self.cipher.dumps(list(context)), eligible, account, user, version))
 
     def recent(self, account, user, version, limit=80):
         with self.connect() as conn:
@@ -425,6 +515,34 @@ class ResultStore:
             conn.execute("INSERT OR REPLACE INTO api_source_meta_v1 VALUES (?,?,?,?)",
                          (account, source_id, protocol, model))
 
+    def api_guidance_get(self, account, user, source_id, subject):
+        with self.connect() as conn:
+            row = conn.execute("SELECT revision,scenario,analyze_self,payload_json,updated_at "
+                               "FROM api_guidance_v1 WHERE account=? AND session=? AND "
+                               "source_id=? AND subject=?", (account, user, source_id, subject)).fetchone()
+        if row is None:
+            return None
+        # Decryption failure must propagate before any obsolete-shape cleanup.
+        guidance = self.cipher.loads(row[3])
+        if not valid_guidance_payload(guidance):
+            with self.connect() as conn:
+                conn.execute("DELETE FROM api_guidance_v1 WHERE account=? AND session=? AND "
+                             "source_id=? AND subject=? AND payload_json=?",
+                             (account, user, source_id, subject, row[3]))
+            return None
+        return {"revision": row[0], "scenario": row[1], "analyzeSelf": bool(row[2]),
+                "guidance": guidance, "updatedAt": row[4]}
+
+    def api_guidance_save(self, account, user, source_id, subject, guidance):
+        if not valid_guidance_payload(guidance):
+            raise ValueError("invalid API guidance")
+        with self.connect() as conn:
+            conn.execute("INSERT OR REPLACE INTO api_guidance_v1 "
+                         "(account,session,source_id,subject,revision,scenario,analyze_self,"
+                         "payload_json,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+                         (account, user, source_id, subject, guidance["version"], guidance.get("scenario", "auto"),
+                          int(guidance.get("analyzeSelf", False)), self.cipher.dumps(guidance), int(time.time())))
+
     def cache_suspended(self, account, source_id):
         with self.connect() as conn:
             return conn.execute("SELECT 1 FROM analysis_cache_suspended_v1 WHERE account=? AND source_id=?",
@@ -469,10 +587,10 @@ class ResultStore:
                                (account, user, source_id, subject)).fetchone()
         if row is None:
             return None
-        portrait = json.loads(row[9])
+        portrait = self.cipher.loads(row[9])
         if not valid_api_portrait(portrait):
             raise RuntimeError("invalid saved API portrait")
-        resume = json.loads(row[10]) if row[10] else None
+        resume = self.cipher.loads(row[10]) if row[10] else None
         if isinstance(resume, dict) and "portraitStatistics" in resume and not valid_statistics(
                 resume["portraitStatistics"], allow_historical_pending=resume.get("portraitLedgerVersion") == 1):
             resume.pop("portraitStatistics", None)
@@ -484,9 +602,16 @@ class ResultStore:
         if isinstance(resume, dict) and "synthesisFingerprint" in resume and not valid_synthesis_fingerprint(
                 resume["synthesisFingerprint"]):
             resume.pop("synthesisFingerprint", None)
+        available = json.loads(row[3])
+        # Legacy MBTI is gated by observed target texts, not classified texts.
+        # Read only after validation: a rejected or absent ledger must count as zero.
+        available["mbtiEvidenceCount"] = (
+            resume["portraitEvidence"]["targetCount"]
+            if isinstance(resume, dict) and isinstance(resume.get("portraitEvidence"), dict)
+            else 0)
         return {"highwater": tuple(json.loads(row[0])) if row[0] else None,
                 "after": tuple(json.loads(row[1])) if row[1] else None,
-                "fingerprint": row[2], "available": json.loads(row[3]),
+                "fingerprint": row[2], "available": available,
                 "plan": json.loads(row[4]), "batchIndex": row[5],
                 "complete": bool(row[6]), "processed": row[7],
                 "processedChars": row[8], "portrait": portrait,
@@ -565,8 +690,8 @@ class ResultStore:
                           json.dumps(highwater) if highwater else None,
                           json.dumps(after) if after else None, fingerprint,
                           json.dumps(available, ensure_ascii=False), json.dumps(plan), 0,
-                          int(unchanged), 0, 0, json.dumps(portrait, ensure_ascii=False),
-                          json.dumps(evidence_resume, ensure_ascii=False) if evidence_resume else None))
+                          int(unchanged), 0, 0, self.cipher.dumps(portrait),
+                          self.cipher.dumps(evidence_resume) if evidence_resume else None))
             if ledger_begin is not None:
                 ledger_begin(conn)
         return self.api_portrait_get(account, user, source_id, subject)
@@ -579,7 +704,7 @@ class ResultStore:
                 "UPDATE api_portrait_v1 SET available_json=?,resume_json=? WHERE account=? AND "
                 "session=? AND source_id=? AND subject=? AND fingerprint=? AND batch_index=? "
                 "AND complete=0",
-                (json.dumps(available, ensure_ascii=False), json.dumps(resume), account, user,
+                (json.dumps(available, ensure_ascii=False), self.cipher.dumps(resume), account, user,
                  source_id, subject, fingerprint, batch_index)).rowcount
             if changed != 1:
                 raise RuntimeError("API portrait checkpoint changed during resume upgrade")
@@ -615,7 +740,7 @@ class ResultStore:
             available = json.loads(row[0])
             if resume is not None:
                 resume = dict(resume)
-                previous_resume = json.loads(row[1]) if row[1] else None
+                previous_resume = self.cipher.loads(row[1]) if row[1] else None
                 if isinstance(previous_resume, dict) and not complete and "portraitDisplayStatistics" in previous_resume:
                     resume["portraitDisplayStatistics"] = previous_resume["portraitDisplayStatistics"]
                 if not valid_synthesis_fingerprint(resume.get("synthesisFingerprint")):
@@ -636,9 +761,9 @@ class ResultStore:
                 available["processedTargetTextCount"] = processed_target
             resume_clause = ",resume_json=?" if resume is not None else ""
             args = (batch_index, int(complete), processed, processed_chars,
-                    json.dumps(portrait, ensure_ascii=False), json.dumps(available, ensure_ascii=False))
+                    self.cipher.dumps(portrait), json.dumps(available, ensure_ascii=False))
             if resume is not None:
-                args += (json.dumps(resume),)
+                args += (self.cipher.dumps(resume),)
             changed = conn.execute("UPDATE api_portrait_v1 SET batch_index=?,complete=?,processed=?,"
                                    "processed_chars=?,portrait_json=?,available_json=?" + resume_clause +
                                    " WHERE account=? AND session=? AND source_id=? AND subject=?",
@@ -670,7 +795,7 @@ class ResultStore:
                                                   "WHERE account=? AND source_id=?",
                                                   (account, LOCAL_SOURCE_ID)).fetchone() is not None}]
             ids = {row[0] for row in conn.execute("SELECT source_id FROM api_source_meta_v1 WHERE account=?", (account,))}
-            for table in ("api_insights_v1", "api_portrait_v1"):
+            for table in ("api_insights_v1", "api_portrait_v1", "api_guidance_v1"):
                 ids.update(raw.split(":", 1)[0] for (raw,) in conn.execute(
                     f"SELECT DISTINCT source_id FROM {table} WHERE account=?", (account,)))
             ids.update(row[0] for row in conn.execute("SELECT source_id FROM analysis_cache_suspended_v1 "
@@ -686,13 +811,15 @@ class ResultStore:
                 portraits = conn.execute("SELECT COUNT(*) FROM (SELECT session,subject FROM api_portrait_v1 "
                                          "WHERE account=? AND source_id LIKE ? GROUP BY session,subject)",
                                          (account, source_id + ":%")).fetchone()[0]
+                guidance = conn.execute("SELECT COUNT(*) FROM api_guidance_v1 WHERE account=? AND "
+                                        "source_id LIKE ?", (account, source_id + ":%")).fetchone()[0]
                 suspended = conn.execute("SELECT 1 FROM analysis_cache_suspended_v1 "
                                          "WHERE account=? AND source_id=?",
                                          (account, source_id)).fetchone() is not None
                 sources.append({"sourceId": source_id, "kind": "api",
                                 "label": meta[1] if meta else "旧 API 来源",
                                 **({"protocol": meta[0]} if meta else {}),
-                                "messageCount": insights, "portraitCount": portraits,
+                                "messageCount": insights, "portraitCount": portraits, "guidanceCount": guidance,
                                 "suspended": suspended})
         return sources
 
@@ -708,7 +835,7 @@ class ResultStore:
                     if table in present:
                         conn.execute(f"DELETE FROM {table} WHERE account=?", (account,))
             else:
-                for table in ("api_insights_v1", "api_portrait_v1"):
+                for table in ("api_insights_v1", "api_portrait_v1", "api_guidance_v1"):
                     conn.execute(f"DELETE FROM {table} WHERE account=? AND source_id LIKE ?",
                                  (account, source_id + ":%"))
                 # A saved source record with zero rows may still carry stale config/job
@@ -775,6 +902,7 @@ class ResultStore:
                     query += " AND subject=?"
                     args += (subject,)
                 counts["portraitRows"] = conn.execute(query, args).rowcount
+                conn.execute(query.replace("api_portrait_v1", "api_guidance_v1"), args)
                 from api_portrait_ledger import clear_ledger
                 clear_ledger(conn, account=account, user=user, source_id=source_id, subject=subject)
         return counts

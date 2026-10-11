@@ -12,6 +12,7 @@ import threading
 import uuid
 from contextlib import closing
 from pathlib import Path
+from process_lock import ProcessLock
 
 
 ACCOUNT_ID = re.compile(r"[0-9a-f]{64}\Z")
@@ -30,6 +31,18 @@ class AccountNotFound(LookupError):
 
 def account_id(account):
     return hashlib.sha256(account.encode("utf-8")).hexdigest()
+
+
+def default_snapshot_root():
+    return Path(tempfile.gettempdir()) / "wechatauto_db"
+
+
+def default_stable_keys_dir():
+    configured = os.environ.get("WECHATAUTO_KEYS_DIR")
+    base = os.environ.get("LOCALAPPDATA") or os.environ.get("USERPROFILE")
+    return Path(configured) if configured else (Path(base) / "wechatauto_keys" if base else None)
+
+
 
 
 def _safe_account(account):
@@ -73,14 +86,10 @@ def _same_checked_directory(left, right):
 class AccountStore:
     def __init__(self, data_dir, snapshot_root=None, stable_keys_dir=None):
         self.data_dir = Path(os.path.abspath(data_dir))
-        self.snapshot_root = Path(os.path.abspath(
-            snapshot_root or Path(tempfile.gettempdir()) / "wechatauto_db"
-        ))
+        self.snapshot_root = Path(os.path.abspath(snapshot_root or default_snapshot_root()))
         self.registry = self.data_dir / "accounts.json"
         if stable_keys_dir is None:
-            configured = os.environ.get("WECHATAUTO_KEYS_DIR")
-            base = os.environ.get("LOCALAPPDATA") or os.environ.get("USERPROFILE")
-            stable_keys_dir = configured or (Path(base) / "wechatauto_keys" if base else None)
+            stable_keys_dir = default_stable_keys_dir()
         self.stable_keys_dir = Path(os.path.abspath(stable_keys_dir)) if stable_keys_dir else None
         self.lock = threading.RLock()
 
@@ -246,7 +255,7 @@ class AccountStore:
             temporary.unlink(missing_ok=True)
 
     def register(self, account, workdir, wechat_id="", nickname=""):
-        with self.lock:
+        with self.lock, ProcessLock(self.data_dir / "accounts.registry.lock").acquire(timeout=10):
             expected = self._workdir(account)
             provided = Path(os.path.abspath(workdir))
             if not _same_checked_directory(provided, expected):
@@ -268,6 +277,11 @@ class AccountStore:
             for identifier, item in records.items():
                 result = self.data_dir / (identifier + ".sqlite3")
                 size = result.stat().st_size if _regular(result) else 0
+                for suffix in (".pre-wv1.sqlite3", ".pre-wv1.json", ".restore-undo.sqlite3",
+                               ".restore-undo.key.bin", ".restore-undo.json"):
+                    backup = self.data_dir / (identifier + suffix)
+                    if _regular(backup):
+                        size += backup.stat().st_size
                 size += sum(path.stat().st_size for path in self._cache_files(item["account"]))
                 items.append({"accountId": identifier, "wechatId": item["wechatId"],
                               "nickname": item["nickname"], "current": identifier == current_id,
@@ -287,7 +301,7 @@ class AccountStore:
     def delete(self, identifier, *, guard, forget, related_cleanup=None):
         if not ACCOUNT_ID.fullmatch(identifier):
             raise ValueError("invalid accountId")
-        with self.lock:
+        with self.lock, ProcessLock(self.data_dir / "accounts.registry.lock").acquire(timeout=10):
             records = self._discover()
             item = records.get(identifier)
             if item is None:
@@ -301,6 +315,11 @@ class AccountStore:
             files, directories = self._owned_tree(account)
             if _regular(result):
                 files.append(result)
+            for suffix in (".pre-wv1.sqlite3", ".pre-wv1.json", ".payload-backup.lock",
+                           ".restore-undo.sqlite3", ".restore-undo.key.bin", ".restore-undo.json"):
+                backup = self.data_dir / (identifier + suffix)
+                if _regular(backup):
+                    files.append(backup)
             for suffix in ("-journal", "-wal", "-shm"):
                 sidecar = Path(str(result) + suffix)
                 if _regular(sidecar):

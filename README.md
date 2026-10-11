@@ -149,9 +149,9 @@ WechatVibe 只读读取本机已登录的 Windows 微信，分析聊天中的情
 
 ## 软件更新
 
-在「设置 → 关于 → 当前版本」检查更新，发现新版本后点击「下载并安装」。下载的文件会先校验，安装完成后自动重启；账号数据、分析结果、画像和已下载的模型都会保留。安装失败会自动恢复旧版，更新成功后也可以回退到上一版（只保留最近一次）。Windows 设置了系统代理时，更新会沿用该代理连接 GitHub。
+在「设置 → 关于 → 当前版本」检查更新，发现新版本后点击「下载并安装」。下载的文件会先校验，安装完成后自动重启；账号数据、分析结果、画像和已下载的模型都会保留。安装失败会自动恢复旧版，更新成功后保留最近一次旧版以便回退；已写入加密分析结果后，回退到不支持该格式的旧版需要兼容性检查和一致性备份。Windows 设置了系统代理时，更新会沿用该代理连接 GitHub。
 
-1.3.0 的改动见[本版更新说明](docs/releases/1.3.0.md)，历次改动见[更新日志](CHANGELOG.md)。
+1.3.5 的改动见[本版更新说明](docs/releases/1.3.5.md)，历次改动见[更新日志](CHANGELOG.md)。
 
 <details>
 <summary>从旧版本升级的注意事项</summary>
@@ -208,7 +208,11 @@ npm start
 
 需要本地 Laya 时，可在首次启动前执行 `npm run setup:models`，或进入应用后下载；仅使用 API 时可跳过模型下载。源码方式下载模型约 681 MB，下载后校验 SHA-256。下载器保留 `.part` 文件供断点续传，网络失败最多尝试三次；完整文件通过大小和 SHA-256 校验后才替换旧文件，强制下载失败不会删除已有模型。默认目录为 `.models/laya`，可通过 `LAYA_MODEL_DIR` 或 `--dir` 指定。Python 安装时请按锁文件安装并保留 `--no-deps`。
 
-应用内“下载模型”使用 GitHub 上的独立模型 ZIP，安装到 `resources/client/.local/models/laya`。当前桌面下载中断后需要重新下载；上述断点续传功能适用于 `npm run setup:models`，两者使用不同的下载入口。
+应用内“下载模型”使用 GitHub 上的独立模型 ZIP，安装到 `resources/client/.local/models/laya`。桌面下载支持断点续传、完整性校验和安装重试：中断后再次下载会复用已收到的部分，服务不支持 Range 时安全重新下载，校验完整后才安装。源码与桌面仍使用各自的下载入口。
+
+1.3.5 已整合贡献者的多模型档案、可控分析范围、单条重算、三个回复选项、多实例及分析结果列加密；功能、数据迁移边界和贡献范围见 [PR 整合版验收说明](docs/pr-integration-acceptance.md)。
+
+开发验收使用 `npm run start:test`，运行当前源码中已整合的完整功能，仅将聊天来源替换为合成会话。首次启动保留本机已配置的助手 Skills 与模型设置；测试聊天、结果和助手历史独立保存，不读取真实微信。详见 [测试客户端](docs/testing.md)。
 
 `npm ci` 完成后会运行 Electron 官方安装器补全桌面运行时；若跳过了安装脚本，启动或构建前执行 `npm run setup:electron`。
 
@@ -309,6 +313,8 @@ WechatVibe 为独立项目，与腾讯、微信没有官方隶属、合作或背
 - 感谢 [wzzzzzzzh](https://github.com/wzzzzzzzh) 通过 [PR #27](https://github.com/tswawa/WechatVibe/pull/27)、[PR #28](https://github.com/tswawa/WechatVibe/pull/28)、[Issue #30](https://github.com/tswawa/WechatVibe/issues/30) 和 [PR #32](https://github.com/tswawa/WechatVibe/pull/32) 贡献换行整理、账号查询提速及读取诊断。本版以等价实现采用扫描预算调整方案，改善部分较大微信进程因旧预算不足而持续未就绪的问题。
 - 感谢 [silicon-sbt](https://github.com/silicon-sbt) 通过 [PR #31](https://github.com/tswawa/WechatVibe/pull/31) 提供累计分析状态异常的定位、最小复现和回归测试，帮助修复情绪证据缺失导致的分析中断，并提供读取问题的独立核对与测试反馈。
 - 感谢 [Berge520](https://github.com/Berge520) 通过 [Issue #24](https://github.com/tswawa/WechatVibe/issues/24) 反馈会话管理与分析恢复问题。
+
+当前待验收源码继续接入：感谢 **wzzzzzzzh** 的 [PR #29](https://github.com/tswawa/WechatVibe/pull/29) 账号选择、多实例以及 [PR #34](https://github.com/tswawa/WechatVibe/pull/34) 瞬态重试；感谢 **nizitao** 的 [PR #33](https://github.com/tswawa/WechatVibe/pull/33) 模型档案、手选分析、并发、沟通建议、旧画像证据兼容及列加密；感谢 **silicon-sbt** 的 [PR #22](https://github.com/tswawa/WechatVibe/pull/22) 单条重算、[PR #23](https://github.com/tswawa/WechatVibe/pull/23) 按钮状态和 [PR #13](https://github.com/tswawa/WechatVibe/pull/13) 悬空句修复与质量研究。各功能的后续修复、主线适配及未采用范围记录在 [整合说明](docs/pr-integration-acceptance.md)，不将局部采用写成整 PR 已合并。
 
 </details>
 

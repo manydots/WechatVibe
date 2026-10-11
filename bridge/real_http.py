@@ -6,7 +6,9 @@ import hmac
 import mimetypes
 import os
 import re
+import shutil
 import threading
+import uuid
 from contextlib import nullcontext
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,10 +16,12 @@ from urllib.parse import parse_qs, urlsplit
 
 from backend_contracts import AccountUnavailableError, MessagesUnavailableError, ForecastRequestError, ROOT
 from backend_service import Backend
+from api_pool import MAX_API_WORKERS
 from wechat_source import WeChatSource
-from account_store import AccountConflict, AccountNotFound
+from account_store import AccountConflict, AccountNotFound, account_id
 from instance_identity import default_port, instance_id
 from model_source import ModelSourceUnavailable
+from payload_crypto import PayloadUnreadable
 from advisor_contracts import AdvisorError
 import advisor_http
 
@@ -75,7 +79,40 @@ def request_id_value(value):
     return value
 
 
-def make_handler(backend, accounts=None, control_token=None):
+def labelled_pin_status(pin_status, accounts):
+    """Name each account the way its owner recognises it.
+
+    A live account is known by its directory name, which is a wxid and indistinguishable by
+    eye. The saved registry carries the nickname a person actually sees in WeChat, the short
+    wechat id, and how much has been cached — enough to tell "the one I have been using"
+    from "the one I just logged into". An account this client has never opened has no entry
+    yet and falls back to the wxid until it has been chosen once.
+    """
+    if accounts is None or not isinstance(pin_status, dict):
+        return pin_status
+    try:
+        known = {item["accountId"]: item for item in accounts.store.list()["accounts"]}
+    except Exception:
+        return pin_status
+
+    def describe(entry):
+        if not isinstance(entry, dict):
+            return entry
+        name = entry.get("account")
+        item = known.get(account_id(name)) if isinstance(name, str) and name else None
+        if not item:
+            return {**entry, "label": name if isinstance(name, str) else ""}
+        nickname = item.get("nickname") or ""
+        wechat_id = item.get("wechatId") or ""
+        return {**entry, "nickname": nickname, "wechatId": wechat_id,
+                "bytes": item.get("bytes", 0),
+                "label": nickname or wechat_id or (name or "")}
+
+    return {**pin_status, "pinned": describe(pin_status.get("pinned")),
+            "live": [describe(entry) for entry in pin_status.get("live", [])]}
+
+
+def make_handler(backend, accounts=None, control_token=None, profile=None):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_args):
             pass
@@ -128,7 +165,15 @@ def make_handler(backend, accounts=None, control_token=None):
                         return self.send(404, {"error": "not found"})
                     return self.send(200, advisor_http.get(backend.advisor_service(), parsed.path, query))
                 if parsed.path == "/api/health":
-                    return self.send(200, {**backend.health(), "instanceId": instance_id(ROOT),
+                    # The identity must follow the profile, or the launcher rejects a second
+                    # instance on its own port as "another service".
+                    health = backend.health()
+                    # The settings row reads the pin from here, so it needs the same labels
+                    # the picker endpoint returns rather than a bare wxid.
+                    if isinstance(health.get("data"), dict) and "accountPin" in health["data"]:
+                        health["data"]["accountPin"] = labelled_pin_status(
+                            health["data"]["accountPin"], accounts)
+                    return self.send(200, {**health, "instanceId": instance_id(ROOT, profile),
                                            "appVersion": APP_VERSION})
                 if parsed.path == "/api/runtime":
                     return self.send(200, backend.runtime())
@@ -136,6 +181,8 @@ def make_handler(backend, accounts=None, control_token=None):
                     return self.send(200, backend.local_model_status())
                 if parsed.path == "/api/data-root":
                     return self.send(200, backend.data_root_status())
+                if parsed.path == "/api/account-pin":
+                    return self.send(200, labelled_pin_status(backend.account_pin_status(), accounts))
                 if parsed.path == "/api/model-source":
                     try:
                         return self.send(200, backend.model_source())
@@ -153,6 +200,24 @@ def make_handler(backend, accounts=None, control_token=None):
                     member = query.get("member")
                     return self.send(200, backend.model_portrait(user_value(query.get("user")),
                                                                  user_value(member) if member else None))
+                if parsed.path == "/api/model-guidance":
+                    member = query.get("member")
+                    reply_options = query.get("replyOptions", "false")
+                    if reply_options not in ("true", "false"):
+                        raise ValueError("invalid reply options flag")
+                    agent_revision = query.get("agentRevision")
+                    if agent_revision is not None:
+                        if (not agent_revision.isascii() or not agent_revision.isdecimal() or
+                                len(agent_revision) > 12):
+                            raise ValueError("invalid assistant revision")
+                        agent_revision = int(agent_revision)
+                    return self.send(200, backend.guidance(user_value(query.get("user")),
+                                                          user_value(member) if member else None,
+                                                          reply_options=reply_options == "true",
+                                                          agent_id=query.get("agentId"),
+                                                          agent_revision=agent_revision))
+                if parsed.path == "/api/api-workers":
+                    return self.send(200, backend.api_worker_status())
                 if parsed.path == "/api/analysis-cache":
                     return self.send(200, backend.analysis_cache_status())
                 if parsed.path == "/api/sessions":
@@ -168,6 +233,8 @@ def make_handler(backend, accounts=None, control_token=None):
                     return self.send(200, backend.conversation_selection())
                 if parsed.path == "/api/analysis-workers":
                     return self.send(200, backend.worker_status())
+                if parsed.path == "/api/analysis-job":
+                    return self.send(200, backend.analysis_job(user_value(query.get("jobId"))))
                 if parsed.path == "/api/analysis-overview":
                     return self.send(200, backend.analysis_overview())
                 if parsed.path == "/api/analysis-performance":
@@ -209,6 +276,10 @@ def make_handler(backend, accounts=None, control_token=None):
                 return self.send(200, target.read_bytes(), mime)
             except AdvisorError as exc:
                 return self.send(advisor_http.error_status(exc), {"error": exc.code, "message": exc.message})
+            except PayloadUnreadable as exc:
+                return self.send(409, {"error": exc.code, "message": str(exc)})
+            except AccountConflict as exc:
+                return self.send(409, {"error": "account-busy", "message": str(exc)})
             except ValueError as exc:
                 return self.send(400, {"error": str(exc)})
             except Exception as exc:
@@ -243,14 +314,16 @@ def make_handler(backend, accounts=None, control_token=None):
                 threading.Thread(target=self.server.shutdown, daemon=True).start()
                 return
             model_endpoints = ("/api/model-source/list", "/api/model-source/test",
-                               "/api/model-source/activate", "/api/model-source/clear-key")
+                               "/api/model-source/activate", "/api/model-source/clear-key",
+                               "/api/model-source/profiles", "/api/model-source/profiles/delete")
             if endpoint not in ("/api/analyze", "/api/predict-reply", "/api/messages/batch",
                                  "/api/runtime", "/api/local-model", "/api/model-insights",
-                                 "/api/model-portrait", "/api/analysis-cache/clear",
+                                 "/api/model-portrait", "/api/model-guidance", "/api/analysis-cache/clear",
                                  "/api/analysis-scope/clear",
                                  "/api/analysis-cache/resume", "/api/conversation-selection",
                                  "/api/data-root", "/api/data-root/clear",
-                                 "/api/analysis-workers",
+                                 "/api/account-pin", "/api/account-pin/clear",
+                                 "/api/analysis-workers", "/api/api-workers",
                                  *advisor_http.POST_PATHS,
                                  *model_endpoints):
                 return self.send(404, {"error": "not found"})
@@ -278,6 +351,10 @@ def make_handler(backend, accounts=None, control_token=None):
                             return self.send(200, backend.model_source_test(request))
                         if endpoint == "/api/model-source/activate":
                             return self.send(200, backend.model_source_activate(request))
+                        if endpoint == "/api/model-source/profiles":
+                            return self.send(200, backend.model_source_profile_save(request))
+                        if endpoint == "/api/model-source/profiles/delete":
+                            return self.send(200, backend.model_source_profile_delete(request))
                         return self.send(200, backend.model_source_clear_key(request))
                     except ValueError:
                         return self.send(400, {"error": "invalid model source request"})
@@ -293,7 +370,15 @@ def make_handler(backend, accounts=None, control_token=None):
                     if elastic is not None and type(elastic) is not bool:
                         raise ValueError("invalid elastic flag")
                     return self.send(200, backend.set_worker_settings(workers, elastic))
+                if endpoint == "/api/api-workers":
+                    if set(request) != {"workers"} or type(request["workers"]) is not int or not 1 <= request["workers"] <= MAX_API_WORKERS:
+                        raise ValueError("invalid API worker count")
+                    return self.send(200, backend.set_api_worker_settings(request["workers"]))
                 if endpoint == "/api/conversation-selection":
+                    if set(request) == {"expectedAccount", "session", "requested"} and type(request["requested"]) is bool:
+                        return self.send(200, backend.set_conversation_requested(
+                            user_value(request["expectedAccount"]), user_value(request["session"]),
+                            request["requested"]))
                     if set(request) == {"expectedAccount", "all"} and request["all"] is True:
                         return self.send(200, backend.set_conversation_all_selected(
                             user_value(request["expectedAccount"])))
@@ -324,6 +409,15 @@ def make_handler(backend, accounts=None, control_token=None):
                     if request:
                         raise ValueError("invalid data root request")
                     return self.send(200, backend.clear_data_root())
+                if endpoint == "/api/account-pin":
+                    if set(request) != {"accountDir"}:
+                        raise ValueError("invalid account pin request")
+                    return self.send(200, labelled_pin_status(
+                        backend.configure_account_pin(request["accountDir"]), accounts))
+                if endpoint == "/api/account-pin/clear":
+                    if request:
+                        raise ValueError("invalid account pin request")
+                    return self.send(200, labelled_pin_status(backend.clear_account_pin(), accounts))
                 if endpoint == "/api/model-insights":
                     account = user_value(request.get("account"))
                     user = user_value(request.get("user"))
@@ -363,6 +457,30 @@ def make_handler(backend, accounts=None, control_token=None):
                         if str(exc) in {"analysis-reset-in-progress", "analysis-reset-busy"}:
                             return self.send(409, {"error": str(exc), "message": "当前分析尚未结束，请稍后重置"})
                         raise
+                if endpoint == "/api/model-guidance":
+                    if not set(request) <= {"account", "user", "member", "scenario", "analyzeSelf", "feedback", "draft", "replyOptions", "sourceId", "agentId", "agentRevision"} or "account" not in request:
+                        raise ValueError("invalid guidance request")
+                    member = request.get("member")
+                    analyze_self = request.get("analyzeSelf", False)
+                    if type(analyze_self) is not bool:
+                        raise ValueError("invalid guidance self-style flag")
+                    try:
+                        return self.send(202, backend.start_guidance(
+                            user_value(request.get("account")), user_value(request.get("user")),
+                            user_value(member) if member is not None else None,
+                            scenario=request.get("scenario", "auto"), analyze_self=analyze_self,
+                            feedback=request.get("feedback"), draft=request.get("draft"),
+                            reply_options=request.get("replyOptions", False),
+                            agent_id=request.get("agentId"), agent_revision=request.get("agentRevision"),
+                            expected_source_id=user_value(request["sourceId"]) if "sourceId" in request else None))
+                    except RuntimeError as exc:
+                        if str(exc) == "model-source-changed":
+                            return self.send(409, {"error": "model-source-changed",
+                                                   "message": "模型来源已切换，请重新生成"})
+                        if str(exc) == "guidance-busy":
+                            return self.send(409, {"error": "guidance-busy",
+                                                   "message": "上一条建议仍在生成，请完成后再试"})
+                        raise
                 if endpoint in ("/api/analysis-cache/clear", "/api/analysis-cache/resume"):
                     if set(request) != {"account", "sourceId"}:
                         raise ValueError("invalid cache request")
@@ -400,16 +518,31 @@ def make_handler(backend, accounts=None, control_token=None):
                 user = user_value(request.get("user"))
                 expected_account = user_value(request.get("account"))
                 mode = request.get("mode")
-                if mode not in ("recent", "history", "incremental"):
+                if mode not in ("recent", "history", "incremental", "message"):
                     raise ValueError("invalid mode")
+                target_ids = request.get("targetIds")
+                if target_ids is not None and mode != "recent":
+                    raise ValueError("invalid analysis targets")
+                if mode == "message":
+                    return self.send(202, {"job": backend.start(
+                        user, mode, integer(request.get("limit"), 80, 500),
+                        expected_account=expected_account,
+                        message_id=user_value(request.get("messageId")))})
                 limit = (None if mode == "incremental" else
                          "all" if mode == "history" and request.get("limit") == "all" else
                          integer(request.get("limit"), 80 if mode == "recent" else 500,
                                  80 if mode == "recent" else 5000))
                 return self.send(202, {"job": backend.start(user, mode, limit,
-                                                             expected_account=expected_account)})
+                                                             expected_account=expected_account,
+                                                             **({"target_ids": target_ids} if target_ids is not None else {}))})
             except ForecastRequestError as exc:
                 return self.send(exc.status, {**echo, "error": exc.code, "message": exc.message})
+            except AdvisorError as exc:
+                return self.send(advisor_http.error_status(exc), {**echo, "error": exc.code, "message": exc.message})
+            except PayloadUnreadable as exc:
+                return self.send(409, {**echo, "error": exc.code, "message": str(exc)})
+            except AccountConflict as exc:
+                return self.send(409, {**echo, "error": "account-busy", "message": str(exc)})
             except (ValueError, UnicodeError, json.JSONDecodeError) as exc:
                 return self.send(400, {**echo, "error": str(exc)})
             except Exception as exc:
@@ -443,20 +576,97 @@ def make_handler(backend, accounts=None, control_token=None):
     return Handler
 
 
+def profile_model_source(profile, root=ROOT):
+    """A profiled instance keeps its own model selection, seeded once from the default one.
+
+    The store records which source is *active*, so one shared file means whichever instance
+    saves last silently reverts the other. Seeding copies the API profile the user already
+    entered instead of making them type it again for every instance.
+    """
+    if profile is None:
+        return None
+    from instance_identity import runtime_dir
+    from model_source import ModelSourceStore
+    root = Path(root)
+    directory = runtime_dir(root, profile)
+    path = directory / "api-model-source.json"
+    shared = root / ".local" / "real-client-runtime" / "api-model-source.json"
+    from process_lock import ProcessLock, checked_path
+    with ProcessLock(directory / "model-source-seed.lock").acquire(timeout=10):
+        checked_path(path)
+        checked_path(shared)
+        if not path.exists() and not shared.exists():
+            legacy = shared.with_name("model-source.json")
+            checked_path(legacy)
+            if legacy.is_file():
+                # The historical filename also held local model directory
+                # settings. Only seed a validated API document from it.
+                legacy_store = ModelSourceStore(shared, root=root, legacy_path=legacy)
+                if legacy_store.saved_selection()["api"] is not None:
+                    shared = legacy
+        if not path.exists() and shared.is_file():
+            pending = directory / ("model-source-seed." + uuid.uuid4().hex + ".tmp")
+            try:
+                with shared.open("rb") as origin, pending.open("xb") as destination:
+                    shutil.copyfileobj(origin, destination)
+                    destination.flush()
+                    os.fsync(destination.fileno())
+                os.link(pending, path)
+            except FileExistsError:
+                pass
+            except OSError as exc:
+                raise ModelSourceUnavailable("model settings initialization unavailable") from exc
+            finally:
+                pending.unlink(missing_ok=True)
+    return ModelSourceStore(path, root=root, legacy_path=directory / "model-source.json")
+
+
 def main(classifier):
+    from installation_gate import InstallationBusy, InstallationGate
+    gate = InstallationGate(ROOT)
+    try:
+        gate.register(role="bridge")
+    except InstallationBusy as exc:
+        print(str(exc), flush=True)
+        return 1
+    try:
+        return _serve(classifier)
+    finally:
+        gate.close()
+
+
+def _serve(classifier):
     from account_api import AccountAPI
+    from account_leases import AccountLeaseRegistry
+    from account_pin_source import AccountPinSource
     from data_root_source import DataRootSource
+    from instance_identity import profile_name, runtime_dir
     control_token = os.environ.pop(CONTROL_TOKEN_ENV, None)
+    profile = profile_name()
     data_root_store = DataRootSource(ROOT)
     data_root_store.apply()
-    backend = Backend(WeChatSource(classifier=classifier), data_root_store=data_root_store)
-    port = integer(os.environ.get("CHATUI_PORT"), default_port(ROOT), 65535)
-    accounts = AccountAPI(backend, ROOT / ".local" / "real-client-data")
-    server = ThreadingHTTPServer(("127.0.0.1", port), make_handler(backend, accounts, control_token))
-    print(f"chatui server on http://127.0.0.1:{port}", flush=True)
+    source = WeChatSource(classifier=classifier)
+    source.account_leases = AccountLeaseRegistry(ROOT)
+    backend = Backend(source, data_root_store=data_root_store,
+                      account_pin_store=AccountPinSource(ROOT, profile),
+                      model_source_store=profile_model_source(profile))
+    # Discovery, snapshots and results stay installation-wide: a reader writes its decrypted
+    # copy under the account name alone, so a per-profile root would not be where the files
+    # land. Two instances are kept off one account by refusing to share it, not by splitting
+    # the storage.
+    server = None
     try:
+        port = integer(os.environ.get("CHATUI_PORT"), default_port(ROOT, profile), 65535)
+        accounts = AccountAPI(backend, ROOT / ".local" / "real-client-data",
+                              runtime_dir=runtime_dir(ROOT, profile))
+        server = ThreadingHTTPServer(("127.0.0.1", port),
+                                     make_handler(backend, accounts, control_token, profile))
+        print(f"chatui server on http://127.0.0.1:{port}", flush=True)
         server.serve_forever()
     finally:
-        server.server_close()
-        backend.shutdown()
+        try:
+            if server is not None:
+                server.server_close()
+        finally:
+            backend.shutdown()
     return 0

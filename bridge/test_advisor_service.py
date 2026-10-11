@@ -8,6 +8,7 @@ from pathlib import Path
 from advisor_contracts import AdvisorError
 from advisor_service import AdvisorService
 from backend_contracts import AccountChangedError
+from model_source import ModelSourceStore
 from test_advisor_support import FakeModelStore, FakeRuntime, FakeSource, wait_until
 
 ACCOUNT = "synthetic-account-1"
@@ -243,6 +244,35 @@ class RunTests(ServiceTestCase):
 
 
 class ConfigurationTests(ServiceTestCase):
+    def profiles_at_same_endpoint(self):
+        store = ModelSourceStore(self.root / "synthetic-model-source.json", root=self.root,
+                                 protect=lambda value: value.encode(), unprotect=lambda value: value.decode())
+        a = store.save_profile(None, "A", "chat_completions", "http://127.0.0.1:9",
+                               "synthetic-model", "synthetic-key-A", 32768)
+        b = store.save_profile(None, "B", "chat_completions", "http://127.0.0.1:9",
+                               "synthetic-model", "synthetic-key-B", 32768)
+        store.select_profile(b)
+        self.service.model_source_store = store
+        return store, a, b
+
+    def test_selected_profile_without_key_never_borrows_same_endpoint_peer_key(self):
+        store, _a, b = self.profiles_at_same_endpoint()
+        store.clear_key(b)
+        with self.assertRaises(AdvisorError) as caught:
+            self.service._resolve_config(ACCOUNT)
+        self.assertEqual(caught.exception.code, "api-not-configured")
+        started = self.service.start(ACCOUNT, USER, AGENT, None, "合成问题", "profile-b-no-key")
+        finished = self.wait_run(started["run"]["id"])
+        self.assertEqual(finished["run"]["state"], "error")
+        self.assertFalse(self.runtime.respond_calls)
+
+    def test_selected_profile_supplies_only_its_own_key_to_assistant(self):
+        self.profiles_at_same_endpoint()
+        started = self.service.start(ACCOUNT, USER, AGENT, None, "合成问题", "profile-b-key")
+        finished = self.wait_run(started["run"]["id"])
+        self.assertEqual(finished["run"]["state"], "done")
+        self.assertEqual(self.runtime.respond_calls[0][0]["apiKey"], "synthetic-key-B")
+
     def test_missing_api_configuration_returns_a_clear_error(self):
         self.model_store.mode = "local"
         self.assertEqual(self.service.catalog()["engine"], {"state": "missing"})

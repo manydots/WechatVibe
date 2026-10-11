@@ -11,9 +11,15 @@
       return {
         sessions: new Map(),
         selectedConversations: new Set(),
+        // Contacts the user asked to analyse with the per-card button. Kept apart from
+        // `selectedConversations` (which is just "added to the list"): only a conversation
+        // in this set may be analysed or appear in the background sweep.
+        requestedConversations: new Set(),
         selectionLoadedAccount: null,
         conversationSelectionBusy: false,
+        conversationSelectionGeneration: 0,
         sessionCache: new Map(),
+        // Unsent composer input is account/conversation scoped and memory-only.
         historyState: null,
         historyRequest: 0,
         historyController: null,
@@ -39,6 +45,10 @@
         generation: 0,
         controller: null,
         messages: [],
+        // 手动「选定几条来分析」：只对用户勾选的 id 提交分析，进入选择态时
+        // 自动扩展到整个窗口的流程会被抑制，退出后恢复。
+        messagePicking: false,
+        selectedMessageIds: new Set(),
         messagePending: false,
         messageRequest: 0,
         messageRefreshQueued: false,
@@ -58,9 +68,13 @@
         requestedRecentSignatures: new Set(),
         recentPending: false,
         intentActionState: "idle",
+        intentRequestScope: null,
         intentFeedbackTimer: null,
         manualRecentAwaitingPost: false,
         manualRecentJobId: null,
+        // Remembered across a deferred start so a user click still reports back
+        // once the first analysis snapshot or the Laya model becomes ready.
+        manualRecentUserInitiated: false,
         manualRecentDeferred: false,
         recentNetworkFailed: false,
         selectedAnalysisTimer: null,
@@ -88,6 +102,7 @@
         analysisNetworkFailed: false,
         activeMember: "",
         profilePending: false,
+        localProfilePollTimer: null,
         groupMembers: [],
         renderedProfileKey: null,
         renderedProfileSignature: null,
@@ -124,7 +139,7 @@
         dataRootRequest: 0,
         dataRootBusy: false,
         dataRootDraftDirty: false,
-        modelSourceSnapshot: { mode: "local", api: null, sourceId: "local", status: "idle" },
+        modelSourceSnapshot: { mode: "local", api: null, profiles: [], label: "", sourceId: "local", status: "idle" },
         modelSourceResolved: false,
         modelSourceReadRequest: 0,
         modelSourceLoadController: null,
@@ -138,6 +153,9 @@
         modelListBusy: false,
         modelTestBusy: false,
         modelSourceDraftDirty: false,
+        // Which saved API profile the settings form is editing ("" = a new one).
+        apiProfileId: "",
+        apiProfileBusy: false,
         suppressedApiSources: new Set(),
         suppressedLocalAccounts: new Set(),
       };

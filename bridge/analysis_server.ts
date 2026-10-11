@@ -43,6 +43,9 @@ import {
   type ModelConfig, type Protocol,
 } from "../electron/model-connectors";
 import { analyzeApiInsights, type ApiInsightMessage } from "../electron/api-message-insights";
+import { analyzeApiGuidance, GUIDANCE_SCENARIOS, GUIDANCE_VERSION,
+  type GuidanceMessage, type GuidanceScenario } from "../electron/api-guidance";
+import { generateReplyOptions, REPLY_OPTIONS_VERSION } from "../electron/api-reply-options";
 import { API_PORTRAIT_CLASSIFIER_VERSION, classifyApiPortraitBatch } from "../electron/api-portrait-classifier";
 import { refreshApiPortraitAxes, updateApiPortrait, extractPortraitObservations, synthesizeApiPortrait,
   type ApiPortrait, type ApiPortraitEvidenceState, type ApiPortraitMessage } from "../electron/api-portrait";
@@ -87,14 +90,48 @@ function connectorConfig(req: Record<string, unknown>, requireModel: boolean): M
     model: typeof req.model === "string" ? req.model : "" };
 }
 
-type ApiGenerationCommand = "model:insights" | "model:portrait" | "model:portrait-axes";
+type ApiGenerationCommand = "model:insights" | "model:portrait" | "model:portrait-axes" | "model:guidance";
 
 function isApiGenerationCommand(cmd: string): cmd is ApiGenerationCommand {
-  return cmd === "model:insights" || cmd === "model:portrait" || cmd === "model:portrait-axes";
+  return cmd === "model:insights" || cmd === "model:portrait" ||
+    cmd === "model:portrait-axes" || cmd === "model:guidance";
 }
 
 async function handleApiGeneration(id: unknown, cmd: ApiGenerationCommand,
   req: Record<string, unknown>): Promise<void> {
+  if (cmd === "model:guidance") {
+    if (req.replyOptions === true) {
+      const result = await generateReplyOptions(connectorConfig(req, true), {
+        messages: req.messages as GuidanceMessage[], contextTokens: req.contextTokens as number,
+        assistant: req.assistant as import("../electron/api-reply-options").ReplyOptionsAssistant,
+      });
+      emit({ id, cmd, analysisVersion: ANALYSIS_VERSION,
+        guidanceVersion: REPLY_OPTIONS_VERSION, ...result });
+      return;
+    }
+    if (req.replyOptions !== undefined && req.replyOptions !== false) {
+      throw new ModelConnectorError("invalid-request", "回复选项格式不正确");
+    }
+    if (!Array.isArray(req.messages) || !Array.isArray(req.targetIds) ||
+        !GUIDANCE_SCENARIOS.includes(req.scenario as GuidanceScenario) ||
+        typeof req.analyzeSelf !== "boolean" || typeof req.contextTokens !== "number") {
+      emit({ id, cmd, analysisVersion: ANALYSIS_VERSION, error: "invalid-request" });
+      return;
+    }
+    const result = await analyzeApiGuidance(connectorConfig(req, true), {
+      messages: req.messages as GuidanceMessage[],
+      targetIds: req.targetIds as string[],
+      scenario: req.scenario as GuidanceScenario,
+      analyzeSelf: req.analyzeSelf,
+      contextTokens: req.contextTokens,
+      ...(typeof req.otherPortrait === "string" ? { otherPortrait: req.otherPortrait } : {}),
+      ...(typeof req.selfSummary === "string" ? { selfSummary: req.selfSummary } : {}),
+      ...(typeof req.feedback === "string" ? { feedback: req.feedback } : {}),
+      ...(typeof req.draft === "string" ? { draft: req.draft } : {}),
+    });
+    emit({ id, cmd, analysisVersion: ANALYSIS_VERSION, guidanceVersion: GUIDANCE_VERSION, ...result });
+    return;
+  }
   if (cmd === "model:insights") {
     if (!Array.isArray(req.messages) || !Array.isArray(req.targetIds)) {
       emit({ id, cmd, analysisVersion: ANALYSIS_VERSION, error: "invalid-request" });
@@ -504,6 +541,7 @@ async function main(): Promise<void> {
     "model:insights": { active: 0, pending: [] },
     "model:portrait": { active: 0, pending: [] },
     "model:portrait-axes": { active: 0, pending: [] },
+    "model:guidance": { active: 0, pending: [] },
   };
   function drainGenerationLane(lane: ApiGenerationLane): void {
     while (lane.active < 10 && lane.pending.length) {
